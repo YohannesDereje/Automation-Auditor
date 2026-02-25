@@ -29,7 +29,7 @@ app = workflow.compile()
 
 if __name__ == "__main__":
 	initial_state = {
-		"repo_url": "https://github.com/your-repo-url",
+		"repo_url": "https://github.com/YohannesDereje/Automation-Auditor.git",
 		"pdf_path": "reports/interim_report.pdf",
 		"rubric_dimensions": [],
 		"evidences": {},
