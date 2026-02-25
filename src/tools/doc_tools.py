@@ -24,6 +24,210 @@ class RubricDimensions(BaseModel):
 	constraints: str = Field(default="")
 
 
+class ForensicChunk(BaseModel):
+	chunk_id: str
+	header: str
+	header_level: int
+	content: str
+	page_numbers: list[int] = Field(default_factory=list)
+	table_metadata: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class DocumentForensics:
+	def __init__(self) -> None:
+		self._markdown_text: str = ""
+		self._json_payload: dict[str, Any] = {}
+		self._chunks: list[ForensicChunk] = []
+
+	@property
+	def chunks(self) -> list[ForensicChunk]:
+		return list(self._chunks)
+
+	def ingest(self, pdf_path: str) -> dict[str, Any]:
+		path = Path(pdf_path)
+		if not path.exists():
+			return self._error_payload("FileNotFoundError", f"PDF file not found: {pdf_path}")
+		if not path.is_file():
+			return self._error_payload("FileNotFoundError", f"PDF path is not a file: {pdf_path}")
+
+		if DocumentConverter is None:
+			return self._error_payload(
+				"ImportError",
+				"Docling is not installed. Run 'uv add docling' and retry.",
+			)
+
+		try:
+			converter = DocumentConverter()
+			result = converter.convert(str(path))
+			markdown_text = DocAnalyst._extract_markdown(result)
+			json_payload = DocAnalyst._extract_json(result)
+
+			self._markdown_text = markdown_text
+			self._json_payload = json_payload
+			self._chunks = self.chunk_markdown_by_headers(markdown_text, json_payload)
+
+			return {
+				"success": True,
+				"pdf_path": str(path),
+				"markdown": markdown_text,
+				"json": json_payload,
+				"chunks": [chunk.model_dump() for chunk in self._chunks],
+			}
+		except Exception as error:
+			return self._error_payload(
+				"CorruptedOrUnreadablePDF",
+				f"Failed to parse PDF with Docling: {error}",
+			)
+
+	def chunk_markdown_by_headers(
+		self,
+		markdown_text: str,
+		json_payload: dict[str, Any] | None = None,
+	) -> list[ForensicChunk]:
+		if not markdown_text.strip():
+			return []
+
+		payload = json_payload or {}
+		global_page_numbers = self._extract_page_numbers(markdown_text, payload)
+		table_metadata = self._extract_table_metadata(payload)
+
+		lines = markdown_text.splitlines()
+		chunks: list[ForensicChunk] = []
+		current_header = "Document Preamble"
+		current_level = 0
+		current_lines: list[str] = []
+		chunk_index = 0
+
+		def flush_current_chunk() -> None:
+			nonlocal chunk_index, current_header, current_level, current_lines
+			content = "\n".join(current_lines).strip()
+			if not content:
+				return
+
+			local_pages = self._extract_page_numbers(content, payload)
+			selected_pages = local_pages if local_pages else global_page_numbers
+			chunk_index += 1
+			chunks.append(
+				ForensicChunk(
+					chunk_id=f"chunk_{chunk_index:03d}",
+					header=current_header,
+					header_level=current_level,
+					content=content,
+					page_numbers=selected_pages,
+					table_metadata=table_metadata,
+				)
+			)
+
+		header_regex = re.compile(r"^(#{1,2})\s+(.*)$")
+
+		for line in lines:
+			match = header_regex.match(line.strip())
+			if match:
+				flush_current_chunk()
+				current_level = len(match.group(1))
+				current_header = match.group(2).strip()
+				current_lines = []
+				continue
+			current_lines.append(line)
+
+		flush_current_chunk()
+		return chunks
+
+	def search_sections(self, query: str) -> list[dict[str, Any]]:
+		if not query or not query.strip():
+			return []
+		if not self._chunks:
+			return []
+
+		keywords = [
+			word.lower()
+			for word in re.findall(r"[a-zA-Z0-9_]+", query)
+			if len(word) > 2
+		]
+		if not keywords:
+			return []
+
+		scored: list[tuple[int, ForensicChunk]] = []
+		for chunk in self._chunks:
+			haystack = f"{chunk.header}\n{chunk.content}".lower()
+			score = sum(haystack.count(keyword) for keyword in keywords)
+			if score > 0:
+				scored.append((score, chunk))
+
+		scored.sort(key=lambda item: item[0], reverse=True)
+		return [item[1].model_dump() for item in scored]
+
+	@staticmethod
+	def _extract_page_numbers(
+		text: str,
+		json_payload: dict[str, Any] | None = None,
+	) -> list[int]:
+		page_numbers = {
+			int(match)
+			for match in re.findall(r"\b(?:page|p\.)\s*(\d{1,4})\b", text, flags=re.IGNORECASE)
+		}
+
+		payload = json_payload or {}
+		for key, value in DocumentForensics._walk_dict(payload):
+			if key.lower() in {"page", "page_no", "page_num", "page_number"}:
+				if isinstance(value, int):
+					page_numbers.add(value)
+				elif isinstance(value, str) and value.isdigit():
+					page_numbers.add(int(value))
+
+		return sorted(number for number in page_numbers if number > 0)
+
+	@staticmethod
+	def _extract_table_metadata(json_payload: dict[str, Any]) -> list[dict[str, Any]]:
+		tables: list[dict[str, Any]] = []
+		for key, value in DocumentForensics._walk_dict(json_payload):
+			if "table" not in key.lower():
+				continue
+
+			if isinstance(value, dict):
+				tables.append(
+					{
+						"key": key,
+						"rows": value.get("rows") or value.get("row_count"),
+						"cols": value.get("cols") or value.get("column_count"),
+						"page": value.get("page")
+						or value.get("page_no")
+						or value.get("page_number"),
+					}
+				)
+			elif isinstance(value, list):
+				tables.append({"key": key, "entries": len(value)})
+
+		return tables
+
+	@staticmethod
+	def _walk_dict(payload: Any) -> list[tuple[str, Any]]:
+		items: list[tuple[str, Any]] = []
+
+		def walk(node: Any, prefix: str = "") -> None:
+			if isinstance(node, dict):
+				for key, value in node.items():
+					full_key = f"{prefix}.{key}" if prefix else str(key)
+					items.append((full_key, value))
+					walk(value, full_key)
+			elif isinstance(node, list):
+				for index, value in enumerate(node):
+					walk(value, f"{prefix}[{index}]")
+
+		walk(payload)
+		return items
+
+	def _error_payload(self, error_type: str, message: str) -> dict[str, Any]:
+		return {
+			"success": False,
+			"error_type": error_type,
+			"error": message,
+			"markdown": "",
+			"json": {},
+			"chunks": [],
+		}
+
+
 class DocAnalyst:
 	def __init__(self) -> None:
 		self._pdf_path: Path | None = None
@@ -31,37 +235,30 @@ class DocAnalyst:
 		self._json_payload: dict[str, Any] = {}
 		self._dimensions = RubricDimensions()
 		self._image_output_dirs: list[str] = []
+		self._forensics = DocumentForensics()
 
 	def load_requirements(self, pdf_path: str) -> dict[str, Any]:
 		path = Path(pdf_path)
-		if not path.exists():
-			raise FileNotFoundError(f"PDF file not found: {pdf_path}")
-		if not path.is_file():
-			raise FileNotFoundError(f"PDF path is not a file: {pdf_path}")
-
-		if DocumentConverter is None:
-			raise RuntimeError(
-				"Docling is not installed. Run 'uv add docling' and retry."
-			)
-
-		try:
-			converter = DocumentConverter()
-			result = converter.convert(str(path))
-		except Exception as error:
-			raise RuntimeError(f"Failed to parse PDF with Docling: {error}") from error
-
-		markdown_text = self._extract_markdown(result)
-		json_payload = self._extract_json(result)
+		result = self._forensics.ingest(pdf_path)
+		if not result.get("success", False):
+			error_type = result.get("error_type", "DoclingError")
+			error_message = result.get("error", "Unknown PDF parsing error")
+			if error_type == "FileNotFoundError":
+				raise FileNotFoundError(error_message)
+			raise RuntimeError(error_message)
 
 		self._pdf_path = path
-		self._markdown_text = markdown_text
-		self._json_payload = json_payload
-
+		self._markdown_text = result.get("markdown", "")
+		self._json_payload = result.get("json", {})
 		return {
 			"pdf_path": str(path),
-			"markdown": markdown_text,
-			"json": json_payload,
+			"markdown": self._markdown_text,
+			"json": self._json_payload,
+			"chunks": result.get("chunks", []),
 		}
+
+	def search_sections(self, query: str) -> list[dict[str, Any]]:
+		return self._forensics.search_sections(query)
 
 	def extract_rubric_dimensions(self) -> RubricDimensions:
 		if not self._markdown_text:
