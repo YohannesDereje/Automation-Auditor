@@ -13,6 +13,7 @@ from src.nodes.detectives import (
     repo_investigator_node,
     vision_inspector_node,
 )
+from src.nodes.judges import defense_node, prosecutor_node, tech_lead_node
 from src.state import AgentState
 
 # Configure logging for professional trace visibility
@@ -40,6 +41,15 @@ def evidence_aggregator_node(state: AgentState):
     
     return {"messages": ["System: All parallel forensic tracks successfully synchronized."]}
 
+
+def chief_justice_node(state: AgentState):
+    opinion_count = len(state.get("opinions", []))
+    return {
+        "messages": [
+            f"ChiefJustice placeholder received {opinion_count} judicial opinions for synthesis."
+        ]
+    }
+
 # --- Graph Construction ---
 
 workflow = StateGraph(AgentState)
@@ -51,6 +61,10 @@ workflow.add_node("vision_inspector_node", vision_inspector_node)
 
 # Add the Critical Fan-In Node
 workflow.add_node("evidence_aggregator_node", evidence_aggregator_node)
+workflow.add_node("prosecutor_node", prosecutor_node)
+workflow.add_node("defense_node", defense_node)
+workflow.add_node("tech_lead_node", tech_lead_node)
+workflow.add_node("chief_justice_node", chief_justice_node)
 
 # Parallel Fan-Out (START -> Detectives)
 workflow.add_edge(START, "doc_analyst_node")
@@ -62,8 +76,18 @@ workflow.add_edge("doc_analyst_node", "evidence_aggregator_node")
 workflow.add_edge("repo_investigator_node", "evidence_aggregator_node")
 workflow.add_edge("vision_inspector_node", "evidence_aggregator_node")
 
+# Judicial Fan-Out (Aggregator -> Judges)
+workflow.add_edge("evidence_aggregator_node", "prosecutor_node")
+workflow.add_edge("evidence_aggregator_node", "defense_node")
+workflow.add_edge("evidence_aggregator_node", "tech_lead_node")
+
+# Judicial Fan-In (Judges -> Chief Justice)
+workflow.add_edge("prosecutor_node", "chief_justice_node")
+workflow.add_edge("defense_node", "chief_justice_node")
+workflow.add_edge("tech_lead_node", "chief_justice_node")
+
 # Final Transition
-workflow.add_edge("evidence_aggregator_node", END)
+workflow.add_edge("chief_justice_node", END)
 
 app = workflow.compile()
 
