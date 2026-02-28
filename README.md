@@ -50,6 +50,14 @@ This architecture ensures one slow or failing branch does not corrupt state from
 uv run python -m src.graph
 ```
 
+Run against a specific repository/PDF without editing code:
+
+```bash
+uv run python -m src.graph -- --repo-url https://github.com/owner/repo.git --pdf-path reports/final_report.pdf
+```
+
+`--pdf-path` is resolved inside the cloned target repository (not your local workspace).
+
 ## Project Structure
 
 ```text
@@ -95,3 +103,6 @@ uv pip list
 ```
 
 - If PDF parsing fails, verify the file exists and path is correct in your initial graph state (`pdf_path`).
+
+
+## uv run python -m src.graph -- --repo-url https://github.com/ephrata1888/automation-auditor.git --pdf-path reports/final_report.pdf

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import argparse
+import logging
+
 from langchain_core.globals import set_debug
 set_debug(True)
-
-import logging
 from langgraph.graph import END, START, StateGraph
 
 
@@ -58,14 +59,16 @@ workflow.add_node("defense_node", defense_node)
 workflow.add_node("tech_lead_node", tech_lead_node)
 workflow.add_node("chief_justice_node", chief_justice_node)
 
-# Parallel Fan-Out (START -> Detectives)
-workflow.add_edge(START, "doc_analyst_node")
+# Stage 1: Repo investigation first (establishes repo_path and repo-scoped pdf_path)
 workflow.add_edge(START, "repo_investigator_node")
-workflow.add_edge(START, "vision_inspector_node")
 
-# Parallel Fan-In (Detectives -> Aggregator)
-workflow.add_edge("doc_analyst_node", "evidence_aggregator_node")
+# Stage 2: Parallel document and vision analysis on resolved target-repo PDF
+workflow.add_edge("repo_investigator_node", "doc_analyst_node")
+workflow.add_edge("repo_investigator_node", "vision_inspector_node")
+
+# Fan-In (Detectives -> Aggregator)
 workflow.add_edge("repo_investigator_node", "evidence_aggregator_node")
+workflow.add_edge("doc_analyst_node", "evidence_aggregator_node")
 workflow.add_edge("vision_inspector_node", "evidence_aggregator_node")
 
 # Judicial Fan-Out (Aggregator -> Judges)
@@ -83,17 +86,39 @@ workflow.add_edge("chief_justice_node", END)
 
 app = workflow.compile()
 
-if __name__ == "__main__":
-    initial_state = {
-        "repo_url": "https://github.com/YohannesDereje/Automation-Auditor.git",
-        "pdf_path": "reports/final_report.pdf",
+
+def _build_initial_state(repo_url: str, pdf_path: str) -> AgentState:
+    return {
+        "repo_url": repo_url,
+        "pdf_path": pdf_path,
         "rubric_dimensions": [],
         "evidences": {},
         "opinions": [],
         "messages": [],
     }
 
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run Automaton Auditor forensic swarm")
+    parser.add_argument(
+        "--repo-url",
+        default="https://github.com/UbdaNam/automated-auditor.git",
+        help="Target Git repository URL to audit",
+    )
+    parser.add_argument(
+        "--pdf-path",
+        default="reports/interim_report.md",
+        help="Path to architectural report PDF",
+    )
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    args = _parse_args()
+    initial_state = _build_initial_state(args.repo_url, args.pdf_path)
+
     print("--- Executing Forensic Swarm ---")
+    print(f"Repo URL: {args.repo_url}")
+    print(f"PDF Path: {args.pdf_path}")
     final_state = app.invoke(initial_state)
     
     evidence_keys = list(final_state.get("evidences", {}).keys())

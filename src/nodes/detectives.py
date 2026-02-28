@@ -26,28 +26,34 @@ _DOC_ANALYST = DocAnalyst()
 _REPO_MANAGER = RepoManager()
 
 
-def _resolve_doc_pdf_path(state_pdf_path: str) -> tuple[str, list[str]]:
-	search_patterns = ["*.pdf", "**/*.pdf", "reports/*.pdf"]
-	workspace_root = Path(__file__).resolve().parents[2]
-	reports_dir = workspace_root / "reports"
-	final_report = reports_dir / "final_report.pdf"
+def _resolve_doc_pdf_path(repo_path: str, state_pdf_path: str) -> tuple[str, list[str]]:
+	search_patterns = ["reports/final_report.pdf", "**/final_report.pdf", "reports/*.pdf", "**/*.pdf"]
 
-	if final_report.exists() and final_report.is_file():
-		return str(final_report), search_patterns
+	if not repo_path:
+		return state_pdf_path, search_patterns
+
+	repo_root = Path(repo_path)
+	if not repo_root.exists() or not repo_root.is_dir():
+		return state_pdf_path, search_patterns
 
 	if state_pdf_path:
 		candidate = Path(state_pdf_path)
-		if not candidate.is_absolute():
-			candidate = workspace_root / candidate
-		if candidate.suffix.lower() == ".pdf" and candidate.exists() and candidate.is_file():
+		if candidate.is_absolute() and candidate.exists() and candidate.is_file():
 			return str(candidate), search_patterns
 
+		relative_candidate = repo_root / state_pdf_path
+		if relative_candidate.suffix.lower() == ".pdf" and relative_candidate.exists() and relative_candidate.is_file():
+			return str(relative_candidate), search_patterns
+
 	for pattern in search_patterns:
-		for file_path in workspace_root.glob(pattern):
+		for file_path in repo_root.glob(pattern):
 			if file_path.suffix.lower() == ".pdf" and file_path.is_file():
 				return str(file_path), search_patterns
 
-	return state_pdf_path, search_patterns
+	if state_pdf_path:
+		return str(repo_root / state_pdf_path), search_patterns
+
+	return str(repo_root / "reports" / "final_report.pdf"), search_patterns
 
 
 def _build_image_message(image_paths: list[str], prompt: str) -> HumanMessage:
@@ -72,8 +78,9 @@ def _build_image_message(image_paths: list[str], prompt: str) -> HumanMessage:
 
 
 def doc_analyst_node(state: AgentState) -> dict[str, Any]:
+	repo_path = state.get("repo_path", "")
 	pdf_path = state.get("pdf_path", "")
-	resolved_pdf_path, search_patterns = _resolve_doc_pdf_path(pdf_path)
+	resolved_pdf_path, search_patterns = _resolve_doc_pdf_path(repo_path, pdf_path)
 
 	try:
 		llm = ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0, verbose=True)
@@ -156,10 +163,12 @@ def doc_analyst_node(state: AgentState) -> dict[str, Any]:
 
 def repo_investigator_node(state: AgentState) -> dict[str, Any]:
 	repo_url = state.get("repo_url", "")
+	state_pdf_path = state.get("pdf_path", "")
 
 	try:
 		repo_path = _REPO_MANAGER.clone_repo(repo_url)
 		analysis = _REPO_MANAGER.analyze_graph_structure(repo_path)
+		resolved_pdf_path, _ = _resolve_doc_pdf_path(repo_path, state_pdf_path)
 
 		summary = analysis.get("summary", {})
 		evidence = Evidence(
@@ -176,9 +185,10 @@ def repo_investigator_node(state: AgentState) -> dict[str, Any]:
 
 		return {
 			"repo_path": repo_path,
+			"pdf_path": resolved_pdf_path,
 			"evidences": {"repo_analysis": [evidence]},
 			"messages": [
-				"repo_investigator_node: clone and AST graph analysis completed."
+				f"repo_investigator_node: clone and AST graph analysis completed. Resolved PDF path: {resolved_pdf_path}"
 			],
 		}
 	except Exception as error:
@@ -197,11 +207,13 @@ def repo_investigator_node(state: AgentState) -> dict[str, Any]:
 
 
 def vision_inspector_node(state: AgentState) -> dict[str, Any]:
+	repo_path = state.get("repo_path", "")
 	pdf_path = state.get("pdf_path", "")
+	resolved_pdf_path, _ = _resolve_doc_pdf_path(repo_path, pdf_path)
 
 	try:
 		llm = ChatGroq(model_name="meta-llama/llama-4-scout-17b-16e-instruct", temperature=0)
-		image_paths = _DOC_ANALYST.extract_images_from_pdf(pdf_path)
+		image_paths = _DOC_ANALYST.extract_images_from_pdf(resolved_pdf_path)
 
 		if image_paths:
 			vision_prompt = (
@@ -234,7 +246,7 @@ def vision_inspector_node(state: AgentState) -> dict[str, Any]:
 			goal="Inspect architectural diagrams for StateGraph fidelity",
 			found=len(image_paths) > 0,
 			content=vision_findings,
-			location=pdf_path,
+			location=resolved_pdf_path,
 			rationale=(
 				"Images were extracted from the PDF and queued for multimodal "
 				"classification using Llama-3.2-Vision on Groq for forensic signals."
@@ -245,7 +257,7 @@ def vision_inspector_node(state: AgentState) -> dict[str, Any]:
 		return {
 			"evidences": {"vision_analysis": [evidence]},
 			"messages": [
-				"vision_inspector_node: image extraction and analysis completed via Llama-3.2-Vision on Groq."
+				f"vision_inspector_node: image extraction and analysis completed via Llama-3.2-Vision on Groq. PDF used: {resolved_pdf_path}"
 			],
 		}
 	except FileNotFoundError as error:

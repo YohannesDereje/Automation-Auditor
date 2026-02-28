@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
@@ -9,12 +10,13 @@ from typing import Any
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 
+from src.nodes.llm_locks import LLM_CALL_LOCK
 from src.state import AgentState, JudicialOpinion
 
 load_dotenv()
 
 _RUBRIC_PATH = Path(__file__).resolve().parents[2] / "rubric.json"
-_REPORT_PATH = Path(__file__).resolve().parents[2] / "audit_report.md"
+_REPORT_PATH = Path(__file__).resolve().parents[2] / "audit" / "report_onpeer_generated.md"
 
 _SECURITY_KEYWORDS = ("security", "os.system", "shell=true", "vulnerability")
 _WEIGHTED_CRITERIA = {"graph_orchestration", "state_management_rigor"}
@@ -28,6 +30,11 @@ class JudgeRecord:
     cited_evidence: list[str]
     effective_score: float
     discounted: bool
+
+
+def _normalize_evidence_text(value: str) -> str:
+    cleaned = value.replace("\\", "/").replace('"', "'").strip().lower()
+    return cleaned[:200]
 
 
 def _load_rubric() -> dict[str, Any]:
@@ -52,7 +59,9 @@ def _collect_evidence_catalog(state: AgentState) -> set[str]:
 
     for bucket_name, evidence_list in evidences.items():
         if bucket_name:
-            catalog.add(str(bucket_name).strip())
+            normalized_bucket = _normalize_evidence_text(str(bucket_name))
+            if normalized_bucket:
+                catalog.add(normalized_bucket)
 
         for evidence_item in evidence_list:
             if isinstance(evidence_item, dict):
@@ -66,7 +75,9 @@ def _collect_evidence_catalog(state: AgentState) -> set[str]:
 
             for value in (goal, location, content):
                 if isinstance(value, str) and value.strip():
-                    catalog.add(value.strip())
+                    normalized_value = _normalize_evidence_text(value)
+                    if normalized_value:
+                        catalog.add(normalized_value)
 
     return catalog
 
@@ -75,16 +86,16 @@ def _has_valid_citation(citations: list[str], evidence_catalog: set[str]) -> boo
     if not citations:
         return False
 
-    lowered_catalog = [entry.lower() for entry in evidence_catalog]
+    lowered_catalog = list(evidence_catalog)
     for citation in citations:
-        normalized = citation.strip()
+        normalized = _normalize_evidence_text(citation)
         if not normalized:
             continue
 
         if normalized in evidence_catalog:
             return True
 
-        probe = normalized.lower()
+        probe = normalized
         if any(probe in source or source in probe for source in lowered_catalog):
             return True
 
@@ -175,40 +186,180 @@ def _build_dissent(records: list[JudgeRecord]) -> str | None:
 
 
 def _llm_summary_and_plan(payload: dict[str, Any]) -> tuple[str, str]:
-    try:
-        llm = ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0)
-        prompt = (
-            "You are the Chief Justice writing the final synthesis for a software audit. "
-            "Use the deterministic scoring results exactly as provided.\n\n"
-            "Return plain text using this exact format:\n"
-            "EXECUTIVE_SUMMARY:\n"
-            "<2-4 sentences, include overall verdict>\n\n"
-            "REMEDIATION_PLAN:\n"
-            "- bullet 1\n"
-            "- bullet 2\n"
-            "- bullet 3\n\n"
-            f"DATA:\n{json.dumps(payload, ensure_ascii=False)}"
-        )
-        response = llm.invoke(prompt)
-        text = response.content if isinstance(response.content, str) else str(response.content)
-
-        if "REMEDIATION_PLAN:" in text and "EXECUTIVE_SUMMARY:" in text:
-            summary_part = text.split("EXECUTIVE_SUMMARY:", 1)[1]
+    def parse_text(raw_text: str) -> tuple[str, str] | None:
+        if "REMEDIATION_PLAN:" in raw_text and "EXECUTIVE_SUMMARY:" in raw_text:
+            summary_part = raw_text.split("EXECUTIVE_SUMMARY:", 1)[1]
             summary_text, plan_text = summary_part.split("REMEDIATION_PLAN:", 1)
             return summary_text.strip(), plan_text.strip()
 
-        return text.strip(), "- Review contested criteria and align evidence citations."
-    except Exception:
-        return (
-            "The audit identifies mixed compliance with several high-risk gaps that require immediate remediation.",
-            "- Resolve security-sensitive tool usage and enforce safe execution patterns.\n"
-            "- Tighten structured-output guarantees and citation validity checks.\n"
-            "- Stabilize graph orchestration, especially fan-out/fan-in and synthesis logic.",
-        )
+        json_candidates = [match.group(0) for match in re.finditer(r"\{[\s\S]*\}", raw_text)]
+        for candidate in json_candidates:
+            try:
+                parsed = json.loads(candidate)
+                summary = parsed.get("executive_summary")
+                plan = parsed.get("remediation_plan")
+                if isinstance(summary, str) and isinstance(plan, str):
+                    return summary.strip(), plan.strip()
+            except Exception:
+                continue
+
+        return None
+
+    def parse_from_error(error: Exception) -> tuple[str, str] | None:
+        failed_generation = getattr(error, "failed_generation", None)
+        if failed_generation is None:
+            return parse_text(str(error))
+
+        if isinstance(failed_generation, str):
+            return parse_text(failed_generation)
+        if isinstance(failed_generation, dict):
+            return parse_text(json.dumps(failed_generation, ensure_ascii=False))
+        if isinstance(failed_generation, list):
+            assembled = "\n".join(
+                item if isinstance(item, str) else json.dumps(item, ensure_ascii=False)
+                for item in failed_generation
+            )
+            return parse_text(assembled)
+
+        return parse_text(str(failed_generation))
+
+    llm = ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0)
+    prompt = (
+        "You are the Chief Justice writing the final synthesis for a software audit. "
+        "Use the deterministic scoring results exactly as provided.\n\n"
+        "Return plain text using this exact format:\n"
+        "EXECUTIVE_SUMMARY:\n"
+        "<2-4 sentences, include overall verdict>\n\n"
+        "REMEDIATION_PLAN:\n"
+        "- bullet 1\n"
+        "- bullet 2\n"
+        "- bullet 3\n\n"
+        f"DATA:\n{json.dumps(payload, ensure_ascii=False)}"
+    )
+    simplified_prompt = (
+        "Your previous summary format was invalid. Provide the response again using exact labels "
+        "EXECUTIVE_SUMMARY and REMEDIATION_PLAN only. Keep content concise and avoid code fences.\n\n"
+        f"DATA:\n{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+    for attempt in range(3):
+        current_prompt = prompt if attempt < 2 else simplified_prompt
+        try:
+            with LLM_CALL_LOCK:
+                response = llm.invoke(current_prompt)
+            text = response.content if isinstance(response.content, str) else str(response.content)
+            parsed = parse_text(text)
+            if parsed is not None:
+                return parsed
+        except Exception as error:
+            parsed = parse_from_error(error)
+            if parsed is not None:
+                return parsed
+
+    return (
+        "The audit identifies mixed compliance with several high-risk gaps that require immediate remediation.",
+        "- Resolve security-sensitive tool usage and enforce safe execution patterns.\n"
+        "- Tighten structured-output guarantees and citation validity checks.\n"
+        "- Stabilize graph orchestration, especially fan-out/fan-in and synthesis logic.",
+    )
 
 
 def chief_justice_node(state: AgentState) -> dict[str, Any]:
     try:
+        def _build_compact_payload(
+            *,
+            overall_score_value: float,
+            overall_grade_value: str,
+            criteria_data: list[dict[str, Any]],
+            synthesis_rules_data: dict[str, Any],
+            argument_limit: int,
+        ) -> dict[str, Any]:
+            compact_criteria: list[dict[str, Any]] = []
+            for criterion in criteria_data:
+                compact_judges: list[dict[str, Any]] = []
+                for judge in criterion.get("judges", []):
+                    argument_text = str(judge.get("argument", "")).strip()
+                    compact_judges.append(
+                        {
+                            "judge_name": judge.get("judge"),
+                            "score": judge.get("score"),
+                            "argument": argument_text[:argument_limit],
+                        }
+                    )
+
+                compact_criteria.append(
+                    {
+                        "criterion_id": criterion.get("criterion_id"),
+                        "criterion_name": criterion.get("criterion_name"),
+                        "final_score": criterion.get("final_score"),
+                        "contested": criterion.get("contested"),
+                        "dissent_summary": criterion.get("dissent_summary"),
+                        "opinions": compact_judges,
+                    }
+                )
+
+            payload = {
+                "overall_score": round(overall_score_value, 2),
+                "overall_grade": overall_grade_value,
+                "criteria": compact_criteria,
+                "synthesis_rules": synthesis_rules_data,
+            }
+
+            if len(str(payload)) > 9000 and argument_limit > 100:
+                return _build_compact_payload(
+                    overall_score_value=overall_score_value,
+                    overall_grade_value=overall_grade_value,
+                    criteria_data=criteria_data,
+                    synthesis_rules_data=synthesis_rules_data,
+                    argument_limit=100,
+                )
+
+            return payload
+
+        def _parse_summary_response(raw_text: str) -> tuple[str, str] | None:
+            if "REMEDIATION_PLAN:" in raw_text and "EXECUTIVE_SUMMARY:" in raw_text:
+                summary_part = raw_text.split("EXECUTIVE_SUMMARY:", 1)[1]
+                summary_text, plan_text = summary_part.split("REMEDIATION_PLAN:", 1)
+                return summary_text.strip(), plan_text.strip()
+
+            json_candidates = [match.group(0) for match in re.finditer(r"\{[\s\S]*\}", raw_text)]
+            for candidate in json_candidates:
+                try:
+                    parsed = json.loads(candidate)
+                    summary = parsed.get("executive_summary")
+                    plan = parsed.get("remediation_plan")
+                    if isinstance(summary, str) and isinstance(plan, str):
+                        return summary.strip(), plan.strip()
+                except Exception:
+                    continue
+
+            return None
+
+        def _invoke_summary_with_payload(payload: dict[str, Any]) -> tuple[str, str]:
+            llm = ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0)
+            prompt = (
+                "You are the Chief Justice writing the final synthesis for a software audit. "
+                "Use the deterministic scoring results exactly as provided. Do not recalculate scores.\n\n"
+                "Return plain text using this exact format:\n"
+                "EXECUTIVE_SUMMARY:\n"
+                "<2-4 sentences, include overall verdict>\n\n"
+                "REMEDIATION_PLAN:\n"
+                "- bullet 1\n"
+                "- bullet 2\n"
+                "- bullet 3\n\n"
+                f"DATA:\n{json.dumps(payload, ensure_ascii=False)}"
+            )
+
+            with LLM_CALL_LOCK:
+                response = llm.invoke(prompt)
+            text = response.content if isinstance(response.content, str) else str(response.content)
+
+            parsed = _parse_summary_response(text)
+            if parsed is not None:
+                return parsed
+
+            raise RuntimeError("Chief Justice summary parser could not parse model output.")
+
         rubric = _load_rubric()
         dimensions = rubric.get("dimensions", [])
 
@@ -234,8 +385,8 @@ def chief_justice_node(state: AgentState) -> dict[str, Any]:
 
             base_score = _criterion_final_score(criterion_id, records)
             final_score = _security_cap(records, base_score)
-            rounded_score = max(1, min(5, int(round(final_score))))
-            criterion_scores.append(float(rounded_score))
+            criterion_score = round(max(1.0, min(5.0, final_score)), 2)
+            criterion_scores.append(criterion_score)
 
             dissent = _build_dissent(records)
             contested = dissent is not None
@@ -255,7 +406,7 @@ def chief_justice_node(state: AgentState) -> dict[str, Any]:
 
             criterion_blocks.append(
                 f"### {criterion_name} (`{criterion_id}`)\n"
-                f"- Final Score: **{rounded_score}/5**\n"
+                f"- Final Score: **{criterion_score:.2f}/5**\n"
                 f"- Contested Verdict: **{'Yes' if contested else 'No'}**\n"
                 + (f"- Dissent Summary: {dissent}\n" if dissent else "")
                 + "\n".join(judge_lines)
@@ -265,7 +416,7 @@ def chief_justice_node(state: AgentState) -> dict[str, Any]:
                 {
                     "criterion_id": criterion_id,
                     "criterion_name": criterion_name,
-                    "final_score": rounded_score,
+                    "final_score": criterion_score,
                     "contested": contested,
                     "dissent_summary": dissent,
                     "judges": [
@@ -289,14 +440,31 @@ def chief_justice_node(state: AgentState) -> dict[str, Any]:
             "The Vibe Coder"
         )
 
-        executive_summary, remediation_plan = _llm_summary_and_plan(
-            {
-                "overall_score": overall_score,
-                "overall_grade": overall_grade,
-                "criteria": synthesis_payload,
-                "synthesis_rules": rubric.get("synthesis_rules", {}),
-            }
+        compact_payload = _build_compact_payload(
+            overall_score_value=overall_score,
+            overall_grade_value=overall_grade,
+            criteria_data=synthesis_payload,
+            synthesis_rules_data=rubric.get("synthesis_rules", {}),
+            argument_limit=200,
         )
+
+        try:
+            executive_summary, remediation_plan = _invoke_summary_with_payload(compact_payload)
+        except Exception as error:
+            error_text = str(error)
+            is_retryable = "413" in error_text or "Request too large" in error_text or "RateLimitError" in error_text
+            if not is_retryable:
+                raise
+
+            __import__("time").sleep(30)
+            retry_payload = _build_compact_payload(
+                overall_score_value=overall_score,
+                overall_grade_value=overall_grade,
+                criteria_data=synthesis_payload,
+                synthesis_rules_data=rubric.get("synthesis_rules", {}),
+                argument_limit=60,
+            )
+            executive_summary, remediation_plan = _invoke_summary_with_payload(retry_payload)
 
         report = (
             "# Executive Summary\n"
