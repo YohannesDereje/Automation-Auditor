@@ -1,29 +1,83 @@
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
+from pathlib import Path
 from typing import Any
+
+from langchain_groq import ChatGroq
+from langchain_core.globals import set_debug
+from langchain_core.messages import HumanMessage
 
 from src.state import AgentState, Evidence
 from src.tools.doc_tools import DocAnalyst
 from src.tools.repo_tools import RepoManager
+
+import os
+from dotenv import load_dotenv
+
+set_debug(True)
+
+load_dotenv() # This pulls the keys from your .env file
 
 
 _DOC_ANALYST = DocAnalyst()
 _REPO_MANAGER = RepoManager()
 
 
+def _build_image_message(image_paths: list[str], prompt: str) -> HumanMessage:
+	content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+
+	for image_path in image_paths[:8]:
+		path = Path(image_path)
+		if not path.exists() or not path.is_file():
+			continue
+
+		mime_type, _ = mimetypes.guess_type(str(path))
+		resolved_mime = mime_type or "image/png"
+		encoded = base64.b64encode(path.read_bytes()).decode("utf-8")
+		content.append(
+			{
+				"type": "image_url",
+				"image_url": {"url": f"data:{resolved_mime};base64,{encoded}"},
+			}
+		)
+
+	return HumanMessage(content=content)
+
+
 def doc_analyst_node(state: AgentState) -> dict[str, Any]:
 	pdf_path = state.get("pdf_path", "")
 
 	try:
+		llm = ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0, verbose=True)
 		loaded = _DOC_ANALYST.load_requirements(pdf_path)
 		dimensions = _DOC_ANALYST.extract_rubric_dimensions()
+		markdown_text = loaded.get("markdown", "")
+
+		refinement_prompt = (
+			"You are a forensic auditor for a LangGraph project. Analyze the provided "
+			"architectural markdown and extract two focused sections:\n"
+			"1) Scoring Rubric Rules\n"
+			"2) Technical Constraints\n"
+			"Return concise JSON with keys 'scoring_rubric_rules' and "
+			"'technical_constraints'.\n\n"
+			f"MARKDOWN:\n{markdown_text[:18000]}"
+		)
+		llm_response = llm.invoke(refinement_prompt)
+		refined_requirements = (
+			llm_response.content
+			if isinstance(llm_response.content, str)
+			else json.dumps(llm_response.content, ensure_ascii=False)
+		)
 
 		requirements_payload = {
 			"objectives": dimensions.objectives,
 			"deliverables": dimensions.deliverables,
 			"constraints": dimensions.constraints,
 			"markdown_length": len(loaded.get("markdown", "")),
+			"llm_refined_requirements": refined_requirements,
 		}
 
 		evidence = Evidence(
@@ -42,7 +96,7 @@ def doc_analyst_node(state: AgentState) -> dict[str, Any]:
 			"rubric_dimensions": [requirements_payload],
 			"evidences": {"doc_analysis": [evidence]},
 			"messages": [
-				"doc_analyst_node: requirements extracted from architectural PDF."
+				"doc_analyst_node: requirements extracted and refined with llama-3.3-70b via Groq."
 			],
 		}
 	except FileNotFoundError as error:
@@ -119,22 +173,44 @@ def vision_inspector_node(state: AgentState) -> dict[str, Any]:
 	pdf_path = state.get("pdf_path", "")
 
 	try:
+		llm = ChatGroq(model_name="meta-llama/llama-4-scout-17b-16e-instruct", temperature=0)
 		image_paths = _DOC_ANALYST.extract_images_from_pdf(pdf_path)
+
+		if image_paths:
+			vision_prompt = (
+				"Look at these architectural diagrams from a LangGraph project. "
+				"Does the diagram show a 'Fan-In' or 'Aggregator' pattern? "
+				"Respond with a brief forensic confirmation."
+			)
+			vision_message = _build_image_message(image_paths, vision_prompt)
+			vision_response = llm.invoke([vision_message])
+			vision_findings = (
+				vision_response.content
+				if isinstance(vision_response.content, str)
+				else json.dumps(vision_response.content, ensure_ascii=False)
+			)
+		else:
+			vision_findings = (
+				"No images were found in the PDF, so Llama Vision analysis could not "
+				"confirm Fan-In/Aggregator diagram patterns."
+			)
+
 		evidence_payload = {
 			"image_count": len(image_paths),
 			"image_paths": image_paths,
-			"vision_status": "Pending Full Inference",
+			"vision_status": "Analyzed",
 			"question": "Is this a StateGraph diagram or a generic box diagram?",
+			"forensic_confirmation": vision_findings,
 		}
 
 		evidence = Evidence(
 			goal="Inspect architectural diagrams for StateGraph fidelity",
 			found=len(image_paths) > 0,
-			content=json.dumps(evidence_payload, ensure_ascii=False),
+			content=vision_findings,
 			location=pdf_path,
 			rationale=(
 				"Images were extracted from the PDF and queued for multimodal "
-				"classification. Full vision-model inference is pending."
+				"classification using Llama-3.2-Vision on Groq for forensic signals."
 			),
 			confidence=0.7 if image_paths else 0.4,
 		)
@@ -142,7 +218,7 @@ def vision_inspector_node(state: AgentState) -> dict[str, Any]:
 		return {
 			"evidences": {"vision_analysis": [evidence]},
 			"messages": [
-				"vision_inspector_node: image extraction complete; vision inference pending."
+				"vision_inspector_node: image extraction and analysis completed via Llama-3.2-Vision on Groq."
 			],
 		}
 	except FileNotFoundError as error:
