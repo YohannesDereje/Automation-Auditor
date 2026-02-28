@@ -13,6 +13,7 @@ from src.nodes.detectives import (
     repo_investigator_node,
     vision_inspector_node,
 )
+from src.nodes.justice import chief_justice_node
 from src.nodes.judges import defense_node, prosecutor_node, tech_lead_node
 from src.state import AgentState
 
@@ -40,15 +41,6 @@ def evidence_aggregator_node(state: AgentState):
         return {"messages": [f"System: Aggregation completed with gaps: {missing}"]}
     
     return {"messages": ["System: All parallel forensic tracks successfully synchronized."]}
-
-
-def chief_justice_node(state: AgentState):
-    opinion_count = len(state.get("opinions", []))
-    return {
-        "messages": [
-            f"ChiefJustice placeholder received {opinion_count} judicial opinions for synthesis."
-        ]
-    }
 
 # --- Graph Construction ---
 
@@ -94,7 +86,7 @@ app = workflow.compile()
 if __name__ == "__main__":
     initial_state = {
         "repo_url": "https://github.com/YohannesDereje/Automation-Auditor.git",
-        "pdf_path": "reports/interim_report.pdf",
+        "pdf_path": "reports/final_report.pdf",
         "rubric_dimensions": [],
         "evidences": {},
         "opinions": [],

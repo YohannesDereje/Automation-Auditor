@@ -26,6 +26,30 @@ _DOC_ANALYST = DocAnalyst()
 _REPO_MANAGER = RepoManager()
 
 
+def _resolve_doc_pdf_path(state_pdf_path: str) -> tuple[str, list[str]]:
+	search_patterns = ["*.pdf", "**/*.pdf", "reports/*.pdf"]
+	workspace_root = Path(__file__).resolve().parents[2]
+	reports_dir = workspace_root / "reports"
+	final_report = reports_dir / "final_report.pdf"
+
+	if final_report.exists() and final_report.is_file():
+		return str(final_report), search_patterns
+
+	if state_pdf_path:
+		candidate = Path(state_pdf_path)
+		if not candidate.is_absolute():
+			candidate = workspace_root / candidate
+		if candidate.suffix.lower() == ".pdf" and candidate.exists() and candidate.is_file():
+			return str(candidate), search_patterns
+
+	for pattern in search_patterns:
+		for file_path in workspace_root.glob(pattern):
+			if file_path.suffix.lower() == ".pdf" and file_path.is_file():
+				return str(file_path), search_patterns
+
+	return state_pdf_path, search_patterns
+
+
 def _build_image_message(image_paths: list[str], prompt: str) -> HumanMessage:
 	content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
 
@@ -49,10 +73,11 @@ def _build_image_message(image_paths: list[str], prompt: str) -> HumanMessage:
 
 def doc_analyst_node(state: AgentState) -> dict[str, Any]:
 	pdf_path = state.get("pdf_path", "")
+	resolved_pdf_path, search_patterns = _resolve_doc_pdf_path(pdf_path)
 
 	try:
 		llm = ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0, verbose=True)
-		loaded = _DOC_ANALYST.load_requirements(pdf_path)
+		loaded = _DOC_ANALYST.load_requirements(resolved_pdf_path)
 		dimensions = _DOC_ANALYST.extract_rubric_dimensions()
 		markdown_text = loaded.get("markdown", "")
 
@@ -73,6 +98,8 @@ def doc_analyst_node(state: AgentState) -> dict[str, Any]:
 		)
 
 		requirements_payload = {
+			"source_pdf": resolved_pdf_path,
+			"search_patterns": search_patterns,
 			"objectives": dimensions.objectives,
 			"deliverables": dimensions.deliverables,
 			"constraints": dimensions.constraints,
@@ -84,7 +111,7 @@ def doc_analyst_node(state: AgentState) -> dict[str, Any]:
 			goal="Extract architectural requirements from PDF",
 			found=True,
 			content=json.dumps(requirements_payload, ensure_ascii=False),
-			location=pdf_path,
+			location=resolved_pdf_path,
 			rationale=(
 				"DocAnalyst successfully parsed the PDF and extracted rubric-oriented "
 				"sections for downstream judicial reasoning."
@@ -96,7 +123,7 @@ def doc_analyst_node(state: AgentState) -> dict[str, Any]:
 			"rubric_dimensions": [requirements_payload],
 			"evidences": {"doc_analysis": [evidence]},
 			"messages": [
-				"doc_analyst_node: requirements extracted and refined with llama-3.3-70b via Groq."
+				f"doc_analyst_node: requirements extracted from {resolved_pdf_path} using PDF patterns {search_patterns}."
 			],
 		}
 	except FileNotFoundError as error:
@@ -104,7 +131,7 @@ def doc_analyst_node(state: AgentState) -> dict[str, Any]:
 			goal="Extract architectural requirements from PDF",
 			found=False,
 			content=str(error),
-			location=pdf_path or "unknown",
+			location=resolved_pdf_path or "unknown",
 			rationale="PDF path was invalid or missing during DocAnalyst ingestion.",
 			confidence=0.0,
 		)
@@ -117,7 +144,7 @@ def doc_analyst_node(state: AgentState) -> dict[str, Any]:
 			goal="Extract architectural requirements from PDF",
 			found=False,
 			content=str(error),
-			location=pdf_path or "unknown",
+			location=resolved_pdf_path or "unknown",
 			rationale="Unexpected failure while parsing project requirements PDF.",
 			confidence=0.0,
 		)
