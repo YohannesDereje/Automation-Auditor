@@ -102,12 +102,12 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Automaton Auditor forensic swarm")
     parser.add_argument(
         "--repo-url",
-        default="https://github.com/UbdaNam/automated-auditor.git",
+        default="https://github.com/yakobd/automaton_auditor_project_tenx.git",
         help="Target Git repository URL to audit",
     )
     parser.add_argument(
         "--pdf-path",
-        default="reports/interim_report.md",
+        default="reports/final_report.pdf",
         help="Path to architectural report PDF",
     )
     return parser.parse_args()

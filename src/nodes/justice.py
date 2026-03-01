@@ -16,7 +16,7 @@ from src.state import AgentState, JudicialOpinion
 load_dotenv()
 
 _RUBRIC_PATH = Path(__file__).resolve().parents[2] / "rubric.json"
-_REPORT_PATH = Path(__file__).resolve().parents[2] / "audit" / "report_onpeer_generated.md"
+_REPORT_PATH = Path(__file__).resolve().parents[2] / "audit" / "report_onfriend_generated_demo.md"
 
 _SECURITY_KEYWORDS = ("security", "os.system", "shell=true", "vulnerability")
 _WEIGHTED_CRITERIA = {"graph_orchestration", "state_management_rigor"}
